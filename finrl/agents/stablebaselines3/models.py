@@ -1,3 +1,17 @@
+"""
+FinRL Stable Baselines3 深層強化学習エージェント実装モジュール
+
+このモジュールは、金融データでの強化学習モデルの訓練・予測・アンサンブル戦略を
+実装するクラスを提供します。
+
+主な機能:
+- 単一モデルの訓練・予測 (DRLAgent)
+- 複数モデルのアンサンブル戦略 (DRLEnsembleAgent)  
+- 動的なモデル選択とリバランシング
+- 市場ボラティリティに基づく適応的制御
+- Tensorboard統合による学習監視
+"""
+
 # DRL models from Stable Baselines 3
 from __future__ import annotations
 
@@ -20,42 +34,61 @@ from finrl import config
 from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
 from finrl.meta.preprocessor.preprocessors import data_split
 
+# サポートする強化学習モデル辞書
 MODELS = {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
 
+# 各モデルのデフォルトパラメータ（config.pyから取得）
 MODEL_KWARGS = {x: config.__dict__[f"{x.upper()}_PARAMS"] for x in MODELS.keys()}
 
+# 探索用ノイズタイプ辞書（連続行動空間用）
 NOISE = {
-    "normal": NormalActionNoise,
-    "ornstein_uhlenbeck": OrnsteinUhlenbeckActionNoise,
+    "normal": NormalActionNoise,  # 正規ノイズ
+    "ornstein_uhlenbeck": OrnsteinUhlenbeckActionNoise,  # Ornstein-Uhlenbeckプロセス
 }
 
 
 class TensorboardCallback(BaseCallback):
     """
-    Custom callback for plotting additional values in tensorboard.
+    Tensorboard用カスタムコールバック
+    
+    学習中の追加情報をTensorboardにログ出力するためのコールバッククラス。
+    報酬の統計情報（最小値、平均値、最大値）を記録します。
     """
 
     def __init__(self, verbose=0):
         super().__init__(verbose)
 
     def _on_step(self) -> bool:
+        """
+        各ステップ後に呼び出されるメソッド
+        
+        現在の報酬をTensorboardに記録します。
+        """
         try:
+            # 報酬情報の記録（複数の形式に対応）
             self.logger.record(key="train/reward", value=self.locals["rewards"][0])
 
         except BaseException as error:
             try:
+                # 別の形式での報酬取得を試行
                 self.logger.record(key="train/reward", value=self.locals["reward"][0])
 
             except BaseException as inner_error:
-                # Handle the case where neither "rewards" nor "reward" is found
+                # どちらの形式でも取得できない場合はNoneを記録
                 self.logger.record(key="train/reward", value=None)
-                # Print the original error and the inner error for debugging
+                # デバッグ用エラー情報出力
                 print("Original Error:", error)
                 print("Inner Error:", inner_error)
         return True
 
     def _on_rollout_end(self) -> bool:
+        """
+        ロールアウト終了時に呼び出されるメソッド
+        
+        報酬の統計情報（最小値、平均値、最大値）をTensorboardに記録します。
+        """
         try:
+            # ロールアウトバッファから報酬を取得
             rollout_buffer_rewards = self.locals["rollout_buffer"].rewards.flatten()
             self.logger.record(
                 key="train/reward_min", value=min(rollout_buffer_rewards)
@@ -67,7 +100,7 @@ class TensorboardCallback(BaseCallback):
                 key="train/reward_max", value=max(rollout_buffer_rewards)
             )
         except BaseException as error:
-            # Handle the case where "rewards" is not found
+            # エラー時はNoneを記録
             self.logger.record(key="train/reward_min", value=None)
             self.logger.record(key="train/reward_mean", value=None)
             self.logger.record(key="train/reward_max", value=None)
@@ -76,25 +109,29 @@ class TensorboardCallback(BaseCallback):
 
 
 class DRLAgent:
-    """Provides implementations for DRL algorithms
+    """
+    深層強化学習エージェントクラス
+    
+    単一の強化学習モデルの訓練、予測、評価を行うためのクラス。
+    複数のStable Baselines3アルゴリズムをサポートし、金融取引環境に特化した
+    機能を提供します。
 
-    Attributes
-    ----------
-        env: gym environment class
-            user-defined class
+    Attributes:
+        env: gym環境クラス - ユーザー定義の取引環境
 
-    Methods
-    -------
-        get_model()
-            setup DRL algorithms
-        train_model()
-            train DRL algorithms in a train dataset
-            and output the trained model
-        DRL_prediction()
-            make a prediction in a test dataset and get results
+    メソッド:
+        get_model(): DRLアルゴリズムの設定
+        train_model(): 訓練データでDRLアルゴリズムを訓練し、訓練済みモデルを出力
+        DRL_prediction(): テストデータで予測を実行し結果を取得
     """
 
     def __init__(self, env):
+        """
+        DRLエージェントの初期化
+        
+        Args:
+            env: 取引環境オブジェクト
+        """
         self.env = env
 
     def get_model(
@@ -107,20 +144,42 @@ class DRLAgent:
         seed=None,
         tensorboard_log=None,
     ):
+        """
+        指定されたアルゴリズムの強化学習モデルを作成
+        
+        Args:
+            model_name: アルゴリズム名 ('a2c', 'ddpg', 'td3', 'sac', 'ppo')
+            policy: 方策タイプ (デフォルト: 'MlpPolicy')
+            policy_kwargs: 方策の追加パラメータ
+            model_kwargs: モデルの追加パラメータ
+            verbose: 詳細度レベル
+            seed: ランダムシード
+            tensorboard_log: Tensorboardログディレクトリ
+            
+        Returns:
+            初期化された強化学習モデル
+            
+        Raises:
+            ValueError: サポートされていないモデル名が指定された場合
+        """
         if model_name not in MODELS:
             raise ValueError(
                 f"Model '{model_name}' not found in MODELS."
-            )  # this is more informative than NotImplementedError("NotImplementedError")
+            )  # NotImplementedErrorより情報豊富
 
+        # デフォルトパラメータの設定
         if model_kwargs is None:
             model_kwargs = MODEL_KWARGS[model_name]
 
+        # 行動ノイズの設定（連続行動空間のアルゴリズム用）
         if "action_noise" in model_kwargs:
             n_actions = self.env.action_space.shape[-1]
             model_kwargs["action_noise"] = NOISE[model_kwargs["action_noise"]](
                 mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions)
             )
         print(model_kwargs)
+        
+        # モデルの作成と返却
         return MODELS[model_name](
             policy=policy,
             env=self.env,
@@ -137,7 +196,22 @@ class DRLAgent:
         tb_log_name,
         total_timesteps=5000,
         callbacks: Type[BaseCallback] = None,
-    ):  # this function is static method, so it can be called without creating an instance of the class
+    ):  
+        """
+        強化学習モデルの訓練
+        
+        staticメソッドとして実装されているため、クラスのインスタンス化なしで呼び出し可能。
+        
+        Args:
+            model: 訓練対象のモデル
+            tb_log_name: Tensorboardログ名
+            total_timesteps: 訓練ステップ数 (デフォルト: 5000)
+            callbacks: 追加のコールバック関数リスト
+            
+        Returns:
+            訓練済みモデル
+        """
+        # Tensorboardコールバックと追加コールバックを統合
         model = model.learn(
             total_timesteps=total_timesteps,
             tb_log_name=tb_log_name,
@@ -153,29 +227,46 @@ class DRLAgent:
 
     @staticmethod
     def DRL_prediction(model, environment, deterministic=True):
-        """make a prediction and get results"""
+        """
+        訓練済みモデルを使用した予測・取引実行
+        
+        Args:
+            model: 訓練済み強化学習モデル
+            environment: 取引環境
+            deterministic: 決定論的行動の選択 (デフォルト: True)
+            
+        Returns:
+            tuple: (口座記録, 行動記録)
+        """
+        # 環境の準備
         test_env, test_obs = environment.get_sb_env()
-        account_memory = None  # This help avoid unnecessary list creation
-        actions_memory = None  # optimize memory consumption
-        # state_memory=[] #add memory pool to store states
+        # メモリ最適化のための初期化
+        account_memory = None  # 不要なリスト作成を回避
+        actions_memory = None  # メモリ消費を最適化
+        # state_memory=[] # 状態を保存するメモリプール
 
         test_env.reset()
         max_steps = len(environment.df.index.unique()) - 1
 
+        # 取引期間全体での予測実行
         for i in range(len(environment.df.index.unique())):
+            # モデルによる行動予測
             action, _states = model.predict(test_obs, deterministic=deterministic)
             # account_memory = test_env.env_method(method_name="save_asset_memory")
             # actions_memory = test_env.env_method(method_name="save_action_memory")
+            # 環境での行動実行
             test_obs, rewards, dones, info = test_env.step(action)
 
+            # 最終ステップで記録を保存（メモリ効率化）
             if (
                 i == max_steps - 1
-            ):  # more descriptive condition for early termination to clarify the logic
+            ):  # 早期終了条件をより分かりやすく記述
                 account_memory = test_env.env_method(method_name="save_asset_memory")
                 actions_memory = test_env.env_method(method_name="save_action_memory")
-            # add current state to state memory
+            # 現在の状態を状態メモリに追加
             # state_memory=test_env.env_method(method_name="save_state_memory")
 
+            # エピソード終了判定
             if dones[0]:
                 print("hit end!")
                 break
@@ -183,26 +274,44 @@ class DRLAgent:
 
     @staticmethod
     def DRL_prediction_load_from_file(model_name, environment, cwd, deterministic=True):
+        """
+        ファイルから読み込んだモデルを使用した予測
+        
+        Args:
+            model_name: モデル名
+            environment: 取引環境
+            cwd: モデルファイルパス
+            deterministic: 決定論的行動の選択
+            
+        Returns:
+            list: エピソード総資産リスト
+            
+        Raises:
+            ValueError: モデル読み込みに失敗した場合
+        """
         if model_name not in MODELS:
             raise ValueError(
                 f"Model '{model_name}' not found in MODELS."
-            )  # this is more informative than NotImplementedError("NotImplementedError")
+            )  # NotImplementedErrorより情報豊富
         try:
-            # load agent
+            # モデルの読み込み
             model = MODELS[model_name].load(cwd)
             print("Successfully load model", cwd)
         except BaseException as error:
             raise ValueError(f"Failed to load agent. Error: {str(error)}") from error
 
-        # test on the testing env
+        # テスト環境での評価
         state = environment.reset()
-        episode_returns = []  # the cumulative_return / initial_account
+        episode_returns = []  # 累積リターン / 初期口座
         episode_total_assets = [environment.initial_total_asset]
         done = False
+        
+        # エピソード実行
         while not done:
             action = model.predict(state, deterministic=deterministic)[0]
             state, reward, done, _ = environment.step(action)
 
+            # 総資産の計算
             total_asset = (
                 environment.amount
                 + (environment.price_ary[environment.day] * environment.stocks).sum()
@@ -217,6 +326,16 @@ class DRLAgent:
 
 
 class DRLEnsembleAgent:
+    """
+    深層強化学習アンサンブルエージェントクラス
+    
+    複数の強化学習アルゴリズム（A2C, PPO, DDPG, SAC, TD3）を組み合わせ、
+    動的にモデル選択を行うアンサンブル戦略を実装します。
+    
+    各リバランシング期間で複数モデルを訓練・評価し、最も性能の良いモデルを
+    選択して取引を実行します。市場のボラティリティに応じた適応的制御も行います。
+    """
+    
     @staticmethod
     def get_model(
         model_name,
@@ -227,22 +346,41 @@ class DRLEnsembleAgent:
         seed=None,
         verbose=1,
     ):
+        """
+        アンサンブル用モデルの作成
+        
+        Args:
+            model_name: アルゴリズム名
+            env: 取引環境
+            policy: 方策タイプ
+            policy_kwargs: 方策パラメータ
+            model_kwargs: モデルパラメータ
+            seed: ランダムシード
+            verbose: 詳細度
+            
+        Returns:
+            初期化されたモデル
+        """
         if model_name not in MODELS:
             raise ValueError(
                 f"Model '{model_name}' not found in MODELS."
-            )  # this is more informative than NotImplementedError("NotImplementedError")
+            )  # NotImplementedErrorより情報豊富
 
+        # パラメータの準備
         if model_kwargs is None:
             temp_model_kwargs = MODEL_KWARGS[model_name]
         else:
             temp_model_kwargs = model_kwargs.copy()
 
+        # 行動ノイズの設定
         if "action_noise" in temp_model_kwargs:
             n_actions = env.action_space.shape[-1]
             temp_model_kwargs["action_noise"] = NOISE[
                 temp_model_kwargs["action_noise"]
             ](mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
         print(temp_model_kwargs)
+        
+        # モデル作成（Tensorboardログ設定含む）
         return MODELS[model_name](
             policy=policy,
             env=env,
@@ -262,6 +400,21 @@ class DRLEnsembleAgent:
         total_timesteps=5000,
         callbacks: Type[BaseCallback] = None,
     ):
+        """
+        アンサンブル用モデルの訓練と保存
+        
+        Args:
+            model: 訓練対象モデル
+            model_name: モデル名
+            tb_log_name: Tensorboardログ名
+            iter_num: イテレーション番号
+            total_timesteps: 訓練ステップ数
+            callbacks: 追加コールバック
+            
+        Returns:
+            訓練済みモデル
+        """
+        # モデル訓練
         model = model.learn(
             total_timesteps=total_timesteps,
             tb_log_name=tb_log_name,
@@ -273,6 +426,7 @@ class DRLEnsembleAgent:
                 else TensorboardCallback()
             ),
         )
+        # 訓練済みモデルの保存
         model.save(
             f"{config.TRAINED_MODEL_DIR}/{model_name.upper()}_{total_timesteps // 1000}k_{iter_num}"
         )
@@ -280,17 +434,28 @@ class DRLEnsembleAgent:
 
     @staticmethod
     def get_validation_sharpe(iteration, model_name):
-        """Calculate Sharpe ratio based on validation results"""
+        """
+        検証結果に基づくSharpe ratioの計算
+        
+        Args:
+            iteration: イテレーション番号
+            model_name: モデル名
+            
+        Returns:
+            float: 計算されたSharpe ratio
+        """
+        # 検証結果の読み込み
         df_total_value = pd.read_csv(
             f"results/account_value_validation_{model_name}_{iteration}.csv"
         )
-        # If the agent did not make any transaction
+        # エージェントが取引を行わなかった場合
         if df_total_value["daily_return"].var() == 0:
             if df_total_value["daily_return"].mean() > 0:
                 return np.inf
             else:
                 return 0.0
         else:
+            # 四半期換算Sharpe ratio
             return (
                 (4**0.5)
                 * df_total_value["daily_return"].mean()
@@ -315,16 +480,38 @@ class DRLEnsembleAgent:
         tech_indicator_list,
         print_verbosity,
     ):
+        """
+        アンサンブルエージェントの初期化
+        
+        Args:
+            df: 金融データのDataFrame
+            train_period: 訓練期間 [開始日, 終了日]
+            val_test_period: 検証・テスト期間 [開始日, 終了日]
+            rebalance_window: リバランシング期間（日数）
+            validation_window: 検証期間（日数）
+            stock_dim: 銘柄数
+            hmax: 最大保有株数
+            initial_amount: 初期資金
+            buy_cost_pct: 買い手数料率
+            sell_cost_pct: 売り手数料率
+            reward_scaling: 報酬スケーリング
+            state_space: 状態空間サイズ
+            action_space: 行動空間サイズ
+            tech_indicator_list: テクニカル指標リスト
+            print_verbosity: 出力詳細度
+        """
         self.df = df
         self.train_period = train_period
         self.val_test_period = val_test_period
 
+        # 取引期間の日付リスト
         self.unique_trade_date = df[
             (df.date > val_test_period[0]) & (df.date <= val_test_period[1])
         ].date.unique()
         self.rebalance_window = rebalance_window
         self.validation_window = validation_window
 
+        # 環境パラメータ
         self.stock_dim = stock_dim
         self.hmax = hmax
         self.initial_amount = initial_amount
@@ -335,10 +522,19 @@ class DRLEnsembleAgent:
         self.action_space = action_space
         self.tech_indicator_list = tech_indicator_list
         self.print_verbosity = print_verbosity
-        self.train_env = None  # defined in train_validation() function
+        self.train_env = None  # train_validation()関数で定義
 
     def DRL_validation(self, model, test_data, test_env, test_obs):
-        """validation process"""
+        """
+        モデルの検証プロセス
+        
+        Args:
+            model: 検証対象モデル
+            test_data: テストデータ
+            test_env: テスト環境
+            test_obs: テスト観測
+        """
+        # 検証期間全体での実行
         for _ in range(len(test_data.index.unique())):
             action, _states = model.predict(test_obs)
             test_obs, rewards, dones, info = test_env.step(action)
@@ -346,14 +542,28 @@ class DRLEnsembleAgent:
     def DRL_prediction(
         self, model, name, last_state, iter_num, turbulence_threshold, initial
     ):
-        """make a prediction based on trained model"""
-
-        # trading env
+        """
+        訓練済みモデルを使用した予測・取引
+        
+        Args:
+            model: 予測に使用するモデル
+            name: モデル名
+            last_state: 前回の最終状態
+            iter_num: イテレーション番号
+            turbulence_threshold: ボラティリティ閾値
+            initial: 初期状態フラグ
+            
+        Returns:
+            最終状態
+        """
+        # 取引データの準備
         trade_data = data_split(
             self.df,
             start=self.unique_trade_date[iter_num - self.rebalance_window],
             end=self.unique_trade_date[iter_num],
         )
+        
+        # 取引環境の構築
         trade_env = DummyVecEnv(
             [
                 lambda: StockTradingEnv(
@@ -381,13 +591,15 @@ class DRLEnsembleAgent:
 
         trade_obs = trade_env.reset()
 
+        # 取引期間での予測・実行
         for i in range(len(trade_data.index.unique())):
             action, _states = model.predict(trade_obs)
             trade_obs, rewards, dones, info = trade_env.step(action)
             if i == (len(trade_data.index.unique()) - 2):
-                # print(env_test.render())
+                # 最終状態の取得
                 last_state = trade_env.envs[0].render()
 
+        # 最終状態をCSVで保存
         df_last_state = pd.DataFrame({"last_state": last_state})
         df_last_state.to_csv(f"results/last_state_{name}_{i}.csv", index=False)
         return last_state
@@ -405,15 +617,32 @@ class DRLEnsembleAgent:
         turbulence_threshold,
     ):
         """
-        Train the model for a single window.
+        単一ウィンドウでのモデル訓練
+        
+        Args:
+            model_name: モデル名
+            model_kwargs: モデルパラメータ
+            sharpe_list: Sharpe ratioリスト
+            validation_start_date: 検証開始日
+            validation_end_date: 検証終了日  
+            timesteps_dict: 各モデルの訓練ステップ数辞書
+            i: イテレーション番号
+            validation: 検証データ
+            turbulence_threshold: ボラティリティ閾値
+            
+        Returns:
+            tuple: (訓練済みモデル, 更新されたSharpe ratioリスト, Sharpe ratio値)
         """
+        # モデルパラメータが未設定の場合はスキップ
         if model_kwargs is None:
             return None, sharpe_list, -1
 
         print(f"======{model_name} Training========")
+        # モデル作成
         model = self.get_model(
             model_name, self.train_env, policy="MlpPolicy", model_kwargs=model_kwargs
         )
+        # モデル訓練
         model = self.train_model(
             model,
             model_name,
@@ -427,6 +656,8 @@ class DRLEnsembleAgent:
             "to ",
             validation_end_date,
         )
+        
+        # 検証環境の構築
         val_env = DummyVecEnv(
             [
                 lambda: StockTradingEnv(
@@ -450,12 +681,16 @@ class DRLEnsembleAgent:
             ]
         )
         val_obs = val_env.reset()
+        
+        # 検証実行
         self.DRL_validation(
             model=model,
             test_data=validation,
             test_env=val_env,
             test_obs=val_obs,
         )
+        
+        # Sharpe ratio計算
         sharpe = self.get_validation_sharpe(i, model_name=model_name)
         print(f"{model_name} Sharpe Ratio: ", sharpe)
         sharpe_list.append(sharpe)
@@ -470,7 +705,24 @@ class DRLEnsembleAgent:
         TD3_model_kwargs,
         timesteps_dict,
     ):
-        # Model Parameters
+        """
+        アンサンブル戦略の実行
+        
+        複数のアルゴリズム（A2C, PPO, DDPG, SAC, TD3）を組み合わせ、
+        各期間で最もパフォーマンスの良いモデルを動的に選択します。
+        
+        Args:
+            A2C_model_kwargs: A2Cモデルパラメータ
+            PPO_model_kwargs: PPOモデルパラメータ  
+            DDPG_model_kwargs: DDPGモデルパラメータ
+            SAC_model_kwargs: SACモデルパラメータ
+            TD3_model_kwargs: TD3モデルパラメータ
+            timesteps_dict: 各モデルの訓練ステップ数辞書
+            
+        Returns:
+            pd.DataFrame: アンサンブル結果の要約DataFrame
+        """
+        # モデルパラメータ辞書
         kwargs = {
             "a2c": A2C_model_kwargs,
             "ppo": PPO_model_kwargs,
@@ -478,34 +730,40 @@ class DRLEnsembleAgent:
             "sac": SAC_model_kwargs,
             "td3": TD3_model_kwargs,
         }
-        # Model Sharpe Ratios
+        
+        # 各モデルのSharpe ratio管理辞書
         model_dct = {k: {"sharpe_list": [], "sharpe": -1} for k in MODELS.keys()}
 
-        """Ensemble Strategy that combines A2C, PPO, DDPG, SAC, and TD3"""
         print("============Start Ensemble Strategy============")
-        # for ensemble model, it's necessary to feed the last state
-        # of the previous model to the current model as the initial state
+        # アンサンブルモデルでは前のモデルの最終状態を
+        # 現在のモデルの初期状態として渡すことが必要
         last_state_ensemble = []
 
+        # 結果記録用リスト
         model_use = []
         validation_start_date_list = []
         validation_end_date_list = []
         iteration_list = []
 
+        # インサンプルボラティリティ閾値の計算
         insample_turbulence = self.df[
             (self.df.date < self.train_period[1])
             & (self.df.date >= self.train_period[0])
         ]
+        # 90%分位点をボラティリティ閾値として設定
         insample_turbulence_threshold = np.quantile(
             insample_turbulence.turbulence.values, 0.90
         )
 
         start = time.time()
+        
+        # リバランシング期間ごとのループ
         for i in range(
             self.rebalance_window + self.validation_window,
             len(self.unique_trade_date),
             self.rebalance_window,
         ):
+            # 検証期間の設定
             validation_start_date = self.unique_trade_date[
                 i - self.rebalance_window - self.validation_window
             ]
@@ -516,16 +774,16 @@ class DRLEnsembleAgent:
             iteration_list.append(i)
 
             print("============================================")
-            # initial state is empty
+            # 初期状態判定
             if i - self.rebalance_window - self.validation_window == 0:
-                # inital state
+                # 初期状態
                 initial = True
             else:
-                # previous state
+                # 前回状態を継承
                 initial = False
 
-            # Tuning trubulence index based on historical data
-            # Turbulence lookback window is one quarter (63 days)
+            # 過去データに基づくボラティリティ調整
+            # ボラティリティ期間は四半期（63日）
             end_date_index = self.df.index[
                 self.df["date"]
                 == self.unique_trade_date[
@@ -534,6 +792,7 @@ class DRLEnsembleAgent:
             ].to_list()[-1]
             start_date_index = end_date_index - 63 + 1
 
+            # 過去ボラティリティデータの取得
             historical_turbulence = self.df.iloc[
                 start_date_index : (end_date_index + 1), :
             ]
@@ -546,28 +805,27 @@ class DRLEnsembleAgent:
                 historical_turbulence.turbulence.values
             )
 
-            # print(historical_turbulence_mean)
-
+            # ボラティリティ閾値の動的調整
             if historical_turbulence_mean > insample_turbulence_threshold:
-                # if the mean of the historical data is greater than the 90% quantile of insample turbulence data
-                # then we assume that the current market is volatile,
-                # therefore we set the 90% quantile of insample turbulence data as the turbulence threshold
-                # meaning the current turbulence can't exceed the 90% quantile of insample turbulence data
+                # 過去データの平均がインサンプルの90%分位点より高い場合
+                # 現在の市場がボラタイルと仮定し、
+                # インサンプルの90%分位点を閾値として設定
                 turbulence_threshold = insample_turbulence_threshold
             else:
-                # if the mean of the historical data is less than the 90% quantile of insample turbulence data
-                # then we tune up the turbulence_threshold, meaning we lower the risk
+                # 過去データの平均がインサンプルの90%分位点より低い場合
+                # ボラティリティ閾値を上げてリスクを下げる
                 turbulence_threshold = np.quantile(
                     insample_turbulence.turbulence.values, 1
                 )
 
+            # 99%分位点に設定（保守的なアプローチ）
             turbulence_threshold = np.quantile(
                 insample_turbulence.turbulence.values, 0.99
             )
             print("turbulence_threshold: ", turbulence_threshold)
 
-            # Environment Setup starts
-            # training env
+            # 環境設定開始
+            # 訓練環境
             train = data_split(
                 self.df,
                 start=self.train_period[0],
@@ -594,6 +852,7 @@ class DRLEnsembleAgent:
                 ]
             )
 
+            # 検証データ
             validation = data_split(
                 self.df,
                 start=self.unique_trade_date[
@@ -601,9 +860,9 @@ class DRLEnsembleAgent:
                 ],
                 end=self.unique_trade_date[i - self.rebalance_window],
             )
-            # Environment Setup ends
+            # 環境設定終了
 
-            # Training and Validation starts
+            # 訓練・検証開始
             print(
                 "======Model training from: ",
                 self.train_period[0],
@@ -612,11 +871,10 @@ class DRLEnsembleAgent:
                     i - self.rebalance_window - self.validation_window
                 ],
             )
-            # print("training: ",len(data_split(df, start=20090000, end=test.datadate.unique()[i-rebalance_window]) ))
-            # print("==============Model Training===========")
-            # Train Each Model
+            
+            # 各モデルの訓練
             for model_name in MODELS.keys():
-                # Train The Model
+                # モデル訓練実行
                 model, sharpe_list, sharpe = self._train_window(
                     model_name,
                     kwargs[model_name],
@@ -628,7 +886,7 @@ class DRLEnsembleAgent:
                     validation,
                     turbulence_threshold,
                 )
-                # Save the model's sharpe ratios, and the model itself
+                # モデルのSharpe ratio記録、モデル自体の保存
                 model_dct[model_name]["sharpe_list"] = sharpe_list
                 model_dct[model_name]["model"] = model
                 model_dct[model_name]["sharpe"] = sharpe
@@ -639,7 +897,8 @@ class DRLEnsembleAgent:
                 "to ",
                 self.unique_trade_date[i - self.rebalance_window],
             )
-            # Environment setup for model retraining up to first trade date
+            
+            # 最初の取引日までのモデル再訓練用環境設定
             # train_full = data_split(self.df, start=self.train_period[0],
             # end=self.unique_trade_date[i - self.rebalance_window])
             # self.train_full_env = DummyVecEnv([lambda: StockTradingEnv(train_full,
@@ -654,16 +913,17 @@ class DRLEnsembleAgent:
             #                                               self.tech_indicator_list,
             #                                              print_verbosity=self.print_verbosity
             # )])
-            # Model Selection based on sharpe ratio
-            # Same order as MODELS: {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
+            
+            # Sharpe ratioに基づくモデル選択
+            # MODELS順序: {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
             sharpes = [model_dct[k]["sharpe"] for k in MODELS.keys()]
-            # Find the model with the highest sharpe ratio
+            # 最高Sharpe ratioのモデルを選択
             max_mod = list(MODELS.keys())[np.argmax(sharpes)]
             model_use.append(max_mod.upper())
             model_ensemble = model_dct[max_mod]["model"]
-            # Training and Validation ends
+            # 訓練・検証終了
 
-            # Trading starts
+            # 取引開始
             print(
                 "======Trading from: ",
                 self.unique_trade_date[i - self.rebalance_window],
@@ -679,11 +939,12 @@ class DRLEnsembleAgent:
                 turbulence_threshold=turbulence_threshold,
                 initial=initial,
             )
-            # Trading ends
+            # 取引終了
 
         end = time.time()
         print("Ensemble Strategy took: ", (end - start) / 60, " minutes")
 
+        # 結果要約DataFrame作成
         df_summary = pd.DataFrame(
             [
                 iteration_list,
